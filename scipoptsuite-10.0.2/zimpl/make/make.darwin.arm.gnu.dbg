@@ -1,0 +1,20 @@
+CPPFLAGS	+=	-DFREEMEM -D__NO_MATH_INLINES -Dinline=
+CFLAGS		=	-O0 -ffp-contract=off -g -fident -ftrapv $(GCCWARN)
+LDFLAGS		=	-lgmp -lm
+
+ifeq ($(ZLIB),true)
+LDFLAGS		+=	-lz
+endif
+
+ifeq ($(LINK),shared)
+#LIBRARY	=	$(LIBDIR)/lib$(LIBNAME).so
+#LIBLINK	=	$(LIBDIR)/lib$(NAME).$(BASE).so
+CFLAGS		+=	-fPIC -fvisibility=hidden
+#AR		=	gcc -shared -o # the trailing space is important
+#ARFLAGS	=       $(LDFLAGS)
+#RANLIB		=	true
+endif
+
+#ifeq ($(LINK),static)
+LDFLAGS		+=	-static
+#endif

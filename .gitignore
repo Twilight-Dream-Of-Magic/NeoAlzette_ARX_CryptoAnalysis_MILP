@@ -1,0 +1,17 @@
+build/
+out/
+_smoke_5min/
+cmake-build*/
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+*.log
+*.bin
+*.csv
+*.lp

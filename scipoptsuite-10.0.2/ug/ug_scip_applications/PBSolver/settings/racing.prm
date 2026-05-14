@@ -1,0 +1,15 @@
+# Quiet = FALSE
+# LogSolvingStatusFilePath = "./logs/"
+# LogNodesTransferFilePath = "./logs/"
+# CheckpointFilePath = "./logs/"
+# SolutionFilePath = "./logs/"
+# WaitTerminationOfThreads = FALSE
+RacingParamsDirPath = "../settings/"
+NMaxRacingBaseParameters = 4
+StopRacingTimeLimit = 7200
+TimeLimit = 1200
+# Racing ramp-up termination criteria : 0 - stop at the number of nodes left reached, 1 - stop at time limit, 2: - stop at the Solver with the
+#  best dual bound value has a certain number of nodes, 3 - adaptive(node first), 4 - adaptive (time first):  [Default value: 4]
+RacingRampUpTerminationCriteria = 1
+CommunicateTighterBoundsInRacing = FALSE
+

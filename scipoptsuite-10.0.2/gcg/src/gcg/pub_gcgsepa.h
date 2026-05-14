@@ -1,0 +1,88 @@
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/*                  This file is part of the program and library             */
+/*          GCG --- Generic Column Generation                                */
+/*                  a Dantzig-Wolfe decomposition based extension            */
+/*                  of the branch-cut-and-price framework                    */
+/*         SCIP --- Solving Constraint Integer Programs                      */
+/*                                                                           */
+/* Copyright (C) 2010-2026 Operations Research, RWTH Aachen University       */
+/*                         Zuse Institute Berlin (ZIB)                       */
+/*                                                                           */
+/*  Licensed under the Apache License, Version 2.0 (the "License");          */
+/*  you may not use this file except in compliance with the License.         */
+/*  You may obtain a copy of the License at                                  */
+/*                                                                           */
+/*      http://www.apache.org/licenses/LICENSE-2.0                           */
+/*                                                                           */
+/*  Unless required by applicable law or agreed to in writing, software      */
+/*  distributed under the License is distributed on an "AS IS" BASIS,        */
+/*  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. */
+/*  See the License for the specific language governing permissions and      */
+/*  limitations under the License.                                           */
+/*                                                                           */
+/*  You should have received a copy of the Apache-2.0 license                */
+/*  along with GCG; see the file LICENSE. If not visit gcg.or.rwth-aachen.de.*/
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/**@file   pub_gcgsepa.h
+ * @ingroup PUBLICCOREAPI
+ * @brief  public methods for GCG separators
+ * @author Christian Puchert
+ * @author Jonas Witt
+ * @author Erik Muehmer
+ */
+
+/*---+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8----+----9----+----0----+----1----+----2*/
+
+#ifndef GCG_PUB_GCGSEPA_H__
+#define GCG_PUB_GCGSEPA_H__
+
+
+#include "scip/scip.h"
+#include "gcg/type_gcg.h"
+
+#ifdef NDEBUG
+#include "gcg/struct_sepagcg.h"
+#endif
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @ingroup SEPARATORS_PUB
+ * @{
+ */
+
+/** sets separator parameters values to
+ *
+ *  - SCIP_PARAMSETTING_DEFAULT which are the default values of all separator parameters
+ *  - SCIP_PARAMSETTING_FAST such that the time spent for separator is decreased
+ *  - SCIP_PARAMSETTING_AGGRESSIVE such that the separator are called more aggressively
+ *  - SCIP_PARAMSETTING_OFF which turns off all separators
+ */
+GCG_EXPORT
+SCIP_RETCODE GCGsetSeparators(
+   GCG*                  gcg,                /**< GCG data structure */
+   SCIP_PARAMSETTING     paramsetting        /**< parameter settings */
+   );
+
+#ifdef NDEBUG
+#define GCGsepaGetScipSeparator(gcgsepa) ((gcgsepa)->separator)
+#else
+/** returns the pointer to the SCIP_SEPA object */
+GCG_EXPORT
+SCIP_SEPA* GCGsepaGetScipSeparator(
+   GCG_SEPA*             gcgsepa             /**< gcg separator data structure */   
+   );
+#endif
+
+#ifdef __cplusplus
+}
+
+#endif
+/** @} */
+#endif
