@@ -28,6 +28,7 @@
 
 #include "model/neoalzette_scip_search_round_function.hpp"
 
+#include <cmath>
 #include <queue>
 
 namespace neoalzette_linear_milp
@@ -270,6 +271,8 @@ namespace neoalzette_linear_milp
 		std::uint32_t value = 0;
 		std::uint32_t weight = std::numeric_limits<std::uint32_t>::max();
 		std::uint64_t best_value_count = 0;
+		std::uint64_t sorted_branch_candidates = 0;
+		std::uint64_t sorted_branch_pruned_by_cutoff = 0;
 	};
 
 	struct ClatBranchScore
@@ -444,6 +447,10 @@ namespace neoalzette_linear_milp
 		std::string						 result_type = "best_found_partial_forest";
 		bool							 hit_global_time_limit = false;
 		bool							 has_global_best = false;
+		// Forest-level best total weight: prefix cumulative weight plus the local
+		// SCIP objective of the audited trunk. This is intentionally not just
+		// the local one-box objective; CDDT/CLAT cutoff pruning subtracts the
+		// candidate prefix weight from this value.
 		double							 global_best_weight = std::numeric_limits<double>::infinity();
 		Endpoint						 global_best_endpoint;
 		int								 global_best_trail_count = 0;
@@ -654,7 +661,7 @@ namespace neoalzette_linear_milp
 
 	static void update_clat_dp_state( ClatDpState& state, std::uint32_t weight, std::uint32_t value, std::uint64_t count )
 	{
-		if ( !state.reachable || weight < state.weight || ( weight == state.weight && value < state.value ) )
+		if ( !state.reachable || weight < state.weight )
 		{
 			state.reachable = true;
 			state.weight = weight;
@@ -663,7 +670,23 @@ namespace neoalzette_linear_milp
 			return;
 		}
 		if ( weight == state.weight )
+		{
+			state.value = std::min( state.value, value );
 			state.count = saturating_add_u64( state.count, count );
+		}
+	}
+
+
+	static std::uint32_t clat_cutoff_from_double( double cutoff_weight )
+	{
+		if ( !std::isfinite( cutoff_weight ) )
+			return std::numeric_limits<std::uint32_t>::max();
+		if ( cutoff_weight < 0.0 )
+			return 0;
+		const double floored = std::floor( cutoff_weight + 1e-9 );
+		if ( floored >= static_cast<double>( std::numeric_limits<std::uint32_t>::max() ) )
+			return std::numeric_limits<std::uint32_t>::max();
+		return static_cast<std::uint32_t>( floored );
 	}
 
 	static bool clat_box_transition_allowed( int next_state, int output_bit, int first_input_bit, int second_input_bit, int current_state )
@@ -678,13 +701,14 @@ namespace neoalzette_linear_milp
 			   next_state + output_bit + first_input_bit + second_input_bit + current_state <= 4;
 	}
 
-	static ClatFreeSlotResult best_clat_free_slot( int free_slot, std::uint32_t slot0, std::uint32_t slot1, std::uint32_t slot2, int bits )
+	static ClatFreeSlotResult best_clat_free_slot( int free_slot, std::uint32_t slot0, std::uint32_t slot1, std::uint32_t slot2, int bits, std::uint32_t cutoff_weight = std::numeric_limits<std::uint32_t>::max() )
 	{
 		if ( free_slot < 0 || free_slot > 2 || bits <= 0 || bits > 32 )
 			return {};
 
 		const std::uint32_t		 mask = linear_oracle::mask_for_bits( bits );
 		std::array<std::uint32_t, 3> fixed { slot0 & mask, slot1 & mask, slot2 & mask };
+		ClatFreeSlotResult result;
 		std::array<ClatDpState, 2> states;
 		states[ 0 ] = ClatDpState { true, 0, 0, 1 };
 		states[ 1 ] = ClatDpState { true, 0, 0, 1 };
@@ -708,7 +732,15 @@ namespace neoalzette_linear_milp
 							continue;
 						if ( !clat_box_transition_allowed( next_state, slot_bits[ 0 ], slot_bits[ 1 ], slot_bits[ 2 ], current_state ) )
 							continue;
+						++result.sorted_branch_candidates;
+						if ( state.weight == std::numeric_limits<std::uint32_t>::max() )
+							continue;
 						const std::uint32_t next_weight = state.weight + static_cast<std::uint32_t>( next_state );
+						if ( next_weight > cutoff_weight )
+						{
+							++result.sorted_branch_pruned_by_cutoff;
+							continue;
+						}
 						const std::uint32_t next_value = state.value | ( static_cast<std::uint32_t>( free_bit ) << bit );
 						update_clat_dp_state( next_states[ next_state ], next_weight, next_value, state.count );
 					}
@@ -719,8 +751,12 @@ namespace neoalzette_linear_milp
 
 		const ClatDpState& best = states[ 0 ];
 		if ( !best.reachable )
-			return {};
-		return ClatFreeSlotResult { true, best.value & mask, best.weight, best.count };
+			return result;
+		result.possible = true;
+		result.value = best.value & mask;
+		result.weight = best.weight;
+		result.best_value_count = best.count;
+		return result;
 	}
 
 	// ------------------------------------------------------------------------
@@ -731,15 +767,16 @@ namespace neoalzette_linear_milp
 	// surrounding forest driver acts as the Q2 layer. CLAT is used only as a
 	// local hint for ordering and early pruning; every accepted characteristic is
 	// still checked by exact Q1 trace verification before aggregation.
-	static ClatBranchScore score_input_source_by_clat( const ForestInputMask& input )
+	static ClatBranchScore score_input_source_by_clat( const ForestInputMask& input, std::uint32_t cutoff_weight = std::numeric_limits<std::uint32_t>::max() )
 	{
 		ClatBranchScore score;
-		score.add_output = best_clat_free_slot( 0, 0, input.mA, input.mB, WORD_SIZE );
-		score.sub_output = best_clat_free_slot( 1, input.mA, 0, input.mB, WORD_SIZE );
+		score.add_output = best_clat_free_slot( 0, 0, input.mA, input.mB, WORD_SIZE, cutoff_weight );
+		score.sub_output = best_clat_free_slot( 1, input.mA, 0, input.mB, WORD_SIZE, cutoff_weight );
 		score.possible = score.add_output.possible || score.sub_output.possible;
 		if ( !score.possible )
 		{
-			score.prune_reason = "clat_no_direct_input_source_addsub_output_hint";
+			const bool cutoff_pruned = score.add_output.sorted_branch_pruned_by_cutoff != 0 || score.sub_output.sorted_branch_pruned_by_cutoff != 0;
+			score.prune_reason = cutoff_pruned ? "clat_no_direct_input_source_addsub_output_hint_within_cutoff" : "clat_no_direct_input_source_addsub_output_hint";
 			return score;
 		}
 		const double add_weight = score.add_output.possible ? static_cast<double>( score.add_output.weight ) : std::numeric_limits<double>::infinity();
@@ -754,9 +791,13 @@ namespace neoalzette_linear_milp
 		if ( result.possible )
 			oss << " " << label << "_best_weight=" << result.weight
 				<< " " << label << "_output_hint=0x" << hex32( result.value )
-				<< " " << label << "_min_outputs=" << result.best_value_count;
+				<< " " << label << "_min_outputs=" << result.best_value_count
+				<< " " << label << "_sorted_branches=" << result.sorted_branch_candidates
+				<< " " << label << "_cutoff_pruned=" << result.sorted_branch_pruned_by_cutoff;
 		else
-			oss << " " << label << "_best_weight=impossible";
+			oss << " " << label << "_best_weight=impossible"
+				<< " " << label << "_sorted_branches=" << result.sorted_branch_candidates
+				<< " " << label << "_cutoff_pruned=" << result.sorted_branch_pruned_by_cutoff;
 		return oss.str();
 	}
 
@@ -879,8 +920,39 @@ namespace neoalzette_linear_milp
 			if ( attempt.clat_branch_score.sub_output.possible )
 				attempt.clat_branch_ordering_score += static_cast<double>( attempt.clat_branch_score.sub_output.weight );
 		}
+		else
+		{
+			attempt.clat_early_pruned = true;
+			attempt.pruned = true;
+			attempt.stop_reason = attempt.clat_branch_score.prune_reason;
+			if ( !attempt.clat_branch_score.add_output.possible )
+				++attempt.clat_impossible;
+			if ( !attempt.clat_branch_score.sub_output.possible )
+				++attempt.clat_impossible;
+		}
+		attempt.clat_add_steps = 1;
+		attempt.clat_sub_steps = 1;
 		attempt.hull_growth = make_hull_growth_points();
 		return attempt;
+	}
+
+	static void apply_clat_cutoff_rescore_for_attempt( ForestAttemptLog& attempt, double cutoff_weight )
+	{
+		if ( !std::isfinite( cutoff_weight ) )
+			return;
+		const std::uint32_t local_cutoff = clat_cutoff_from_double( cutoff_weight );
+		attempt.clat_branch_score = score_input_source_by_clat( attempt.input, local_cutoff );
+		attempt.clat_branch_order_message = clat_branch_order_message( attempt );
+		attempt.clat_branch_ordering_score = 0.0;
+		if ( attempt.clat_branch_score.add_output.possible )
+			attempt.clat_branch_ordering_score += static_cast<double>( attempt.clat_branch_score.add_output.weight );
+		if ( attempt.clat_branch_score.sub_output.possible )
+			attempt.clat_branch_ordering_score += static_cast<double>( attempt.clat_branch_score.sub_output.weight );
+	}
+
+	static bool clat_score_exceeds_cutoff( const ClatBranchScore& score, double cutoff_weight )
+	{
+		return std::isfinite( cutoff_weight ) && std::isfinite( score.score ) && score.score > cutoff_weight + 1e-8;
 	}
 
 	static void update_hull_growth( ForestAttemptLog& attempt, double weight, long double signed_contribution, long double abs_contribution )
@@ -1257,15 +1329,16 @@ namespace neoalzette_linear_milp
 		update_hull_growth( attempt, result.snapshot.objective, result.signed_correlation_contribution, result.abs_correlation_contribution );
 		update_stage_weight_profile( attempt.stage_weight_profile, result.weight_trace );
 
-		if ( !run_log.has_global_best || result.snapshot.objective < run_log.global_best_weight - 1e-8 )
+		const double forest_total_weight = attempt.cumulative_weight_before + result.snapshot.objective;
+		if ( !run_log.has_global_best || forest_total_weight < run_log.global_best_weight - 1e-8 )
 		{
 			run_log.has_global_best = true;
-			run_log.global_best_weight = result.snapshot.objective;
+			run_log.global_best_weight = forest_total_weight;
 			run_log.global_best_endpoint = endpoint;
 			run_log.global_best_trail_count = 1;
 			attempt.updated_global_best = true;
 		}
-		else if ( std::fabs( result.snapshot.objective - run_log.global_best_weight ) <= 1e-8 )
+		else if ( std::fabs( forest_total_weight - run_log.global_best_weight ) <= 1e-8 )
 		{
 			++run_log.global_best_trail_count;
 		}
@@ -1369,7 +1442,9 @@ namespace neoalzette_linear_milp
 					  << indent << "  \"possible\": " << ( result.possible ? "true" : "false" ) << ",\n"
 					  << indent << "  \"best_value\": " << ( result.possible ? json_string( "0x" + hex32( result.value ) ) : "null" ) << ",\n"
 					  << indent << "  \"best_weight\": " << ( result.possible ? std::to_string( result.weight ) : "null" ) << ",\n"
-					  << indent << "  \"best_value_count\": " << result.best_value_count << "\n"
+					  << indent << "  \"best_value_count\": " << result.best_value_count << ",\n"
+					  << indent << "  \"sorted_branch_candidates\": " << result.sorted_branch_candidates << ",\n"
+					  << indent << "  \"sorted_branch_pruned_by_cutoff\": " << result.sorted_branch_pruned_by_cutoff << "\n"
 					  << indent << "}";
 	}
 
@@ -1764,6 +1839,34 @@ namespace neoalzette_linear_milp
 			ForestCandidate candidate = candidate_bank.top();
 			candidate_bank.pop();
 			ForestAttemptLog attempt = make_forest_attempt( candidate, run_log.total_attempts, bank_size_before );
+			if ( run_log.has_global_best )
+			{
+				const double local_cutoff = run_log.global_best_weight - candidate.cumulative_weight;
+				attempt.bnb_prune_checked = true;
+				attempt.bnb_previous_global_best = run_log.global_best_weight;
+				attempt.bnb_cutoff_weight = local_cutoff;
+				attempt.bnb_prune_rule = "clat_q2_sorted_free_slot_bound";
+				attempt.bnb_bound_expression = "candidate_cumulative_weight + CLAT_Q2_local_lower_bound <= global_best_weight";
+				apply_clat_cutoff_rescore_for_attempt( attempt, local_cutoff );
+				attempt.bnb_candidate_weight = std::isfinite( attempt.clat_branch_score.score ) ? candidate.cumulative_weight + attempt.clat_branch_score.score : std::numeric_limits<double>::infinity();
+				if ( local_cutoff < -1e-8 )
+				{
+					attempt.clat_early_pruned = true;
+					attempt.bnb_pruned = true;
+					attempt.bnb_prune_proven = true;
+					attempt.pruned = true;
+					attempt.stop_reason = "clat_q2_cutoff_negative_after_cumulative_weight";
+					attempt.bnb_prune_message = "cumulative weight already exceeds the current forest global best";
+				}
+				else if ( clat_score_exceeds_cutoff( attempt.clat_branch_score, local_cutoff ) )
+				{
+					attempt.bnb_prune_message = "CLAT Q2 helper exceeded cutoff; kept for SCIP because this source-level helper is a bound/order oracle, not a complete operator-level Matsui branch";
+				}
+				else
+				{
+					attempt.bnb_prune_message = "CLAT Q2 bound kept candidate; SCIP receives the same objective cutoff";
+				}
+			}
 			attempt.input_frequency = ++input_frequency[ pack_input_mask( attempt.input ) ];
 			attempt.duplicate_input = attempt.input_frequency > 1;
 			run_log.max_layer = std::max( run_log.max_layer, attempt.layer );
@@ -1775,8 +1878,18 @@ namespace neoalzette_linear_milp
 			print_clat_branch_order( attempt );
 			++run_log.total_attempts;
 
+			if ( attempt.clat_early_pruned )
+			{
+				attempt.candidate_bank_size_after = static_cast<int>( candidate_bank.size() );
+				absorb_attempt_totals( run_log, attempt );
+				run_log.attempts.push_back( std::move( attempt ) );
+				continue;
+			}
+
 			const double best_remaining_total_budget = forest_remaining_total_budget_for_next_milp( forest_options, forest_start );
 			SearchOptions best_options = make_best_search_options_for_input( options, attempt.input, best_remaining_total_budget );
+			if ( attempt.bnb_prune_checked && std::isfinite( attempt.bnb_cutoff_weight ) )
+				best_options.objective_window_to = std::max( 0.0, attempt.bnb_cutoff_weight );
 			NoGoodStore best_no_goods;
 			ScipSolveResult best_result = solve_linear_model( best_options, best_no_goods, true );
 			++attempt.solver_calls;
@@ -1805,7 +1918,7 @@ namespace neoalzette_linear_milp
 			NoGoodStore endpoint_enumeration;
 			record_feasible_forest_trail( attempt, run_log, best_options, forest_options.hull_characteristics_jsonl, best_result, grouped_counts, endpoint_enumeration, clat_cache );
 			attempt.solver_best_weight = best_result.snapshot.objective;
-			if ( run_log.has_global_best && std::fabs( best_result.snapshot.objective - run_log.global_best_weight ) <= 1e-8 ) current_best_result = best_result;
+			if ( run_log.has_global_best && std::fabs( candidate.cumulative_weight + best_result.snapshot.objective - run_log.global_best_weight ) <= 1e-8 ) current_best_result = best_result;
 			if ( attempt.stop_reason == "q1_verification_failed" )
 			{
 				finalize_attempt_distribution( attempt, grouped_counts );
@@ -1911,7 +2024,7 @@ namespace neoalzette_linear_milp
 						break;
 					}
 					record_feasible_forest_trail( attempt, run_log, enum_options, forest_options.hull_characteristics_jsonl, enum_result, grouped_counts, endpoint_enumeration, clat_cache );
-					if ( run_log.has_global_best && std::fabs( enum_result.snapshot.objective - run_log.global_best_weight ) <= 1e-8 ) current_best_result = enum_result;
+					if ( run_log.has_global_best && std::fabs( candidate.cumulative_weight + enum_result.snapshot.objective - run_log.global_best_weight ) <= 1e-8 ) current_best_result = enum_result;
 					if ( attempt.stop_reason == "q1_verification_failed" || enum_result.hit_time_limit ) break;
 					endpoint_session.exclude_characteristic( enum_result.no_good );
 				}

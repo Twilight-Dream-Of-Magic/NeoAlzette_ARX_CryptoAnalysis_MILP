@@ -87,6 +87,7 @@
 
 #include "model/neoalzette_scip_search_round_function.hpp"
 
+#include <cmath>
 #include <queue>
 
 namespace neoalzette_diff_milp
@@ -368,6 +369,10 @@ namespace neoalzette_diff_milp
 		std::string						  result_type = "best_found_partial_forest";
 		bool							  hit_global_time_limit = false;
 		bool							  has_global_best = false;
+		// Forest-level best total weight: prefix cumulative weight plus the local
+		// SCIP objective of the audited trunk. This is intentionally not just
+		// the local one-box objective; CDDT/CLAT cutoff pruning subtracts the
+		// candidate prefix weight from this value.
 		double							  global_best_weight = std::numeric_limits<double>::infinity();
 		Endpoint						  global_best_endpoint;
 		int								  global_best_trail_count = 0;
@@ -789,6 +794,37 @@ namespace neoalzette_diff_milp
 		return attempt;
 	}
 
+
+	static std::uint32_t cddt_cutoff_from_double( double cutoff_weight )
+	{
+		if ( !std::isfinite( cutoff_weight ) )
+			return std::numeric_limits<std::uint32_t>::max();
+		if ( cutoff_weight < 0.0 )
+			return 0;
+		const double floored = std::floor( cutoff_weight + 1e-9 );
+		if ( floored >= static_cast<double>( std::numeric_limits<std::uint32_t>::max() ) )
+			return std::numeric_limits<std::uint32_t>::max();
+		return static_cast<std::uint32_t>( floored );
+	}
+
+	static void apply_cddt_cutoff_rescore_for_attempt( ForestAttemptLog& attempt, double cutoff_weight )
+	{
+		if ( !std::isfinite( cutoff_weight ) )
+			return;
+		const std::uint32_t local_cutoff = cddt_cutoff_from_double( cutoff_weight );
+		attempt.cddt_branch_score = score_input_source_by_cddt( attempt.input, local_cutoff );
+		attempt.cddt_branch_order_message = cddt_branch_order_message( attempt );
+		attempt.cddt_operator_steps.sorted_branch_checks += 1;
+		attempt.cddt_operator_steps.local_bound_checks += 2;
+		attempt.cddt_operator_steps.branch_order_hints += 2;
+		attempt.cddt_operator_steps.early_prune_checks += 1;
+	}
+
+	static bool cddt_score_exceeds_cutoff( const CddtBranchScore& score, double cutoff_weight )
+	{
+		return std::isfinite( cutoff_weight ) && std::isfinite( score.score ) && score.score > cutoff_weight + 1e-8;
+	}
+
 	static void update_hull_growth( ForestAttemptLog& attempt, double weight, long double probability )
 	{
 		if ( !std::isfinite( attempt.local_best_weight ) )
@@ -988,7 +1024,7 @@ namespace neoalzette_diff_milp
 
 	static void update_cddt_dp_state( CddtDpState& state, std::uint32_t weight, std::uint32_t value, std::uint64_t count )
 	{
-		if ( !state.reachable || weight < state.weight || ( weight == state.weight && value < state.value ) )
+		if ( !state.reachable || weight < state.weight )
 		{
 			state.reachable = true;
 			state.weight = weight;
@@ -997,7 +1033,10 @@ namespace neoalzette_diff_milp
 			return;
 		}
 		if ( weight == state.weight )
+		{
+			state.value = std::min( state.value, value );
 			state.count = saturating_add_u64( state.count, count );
+		}
 	}
 
 	static bool cddt_lipmaa_moriai_step_possible( const std::array<int, 3>& previous_bits, const std::array<int, 3>& current_bits )
@@ -1122,7 +1161,8 @@ namespace neoalzette_diff_milp
 		score.possible = score.add_output.possible || score.sub_output.possible;
 		if ( !score.possible )
 		{
-			score.prune_reason = "cddt_no_two_variable_addsub_output";
+			const bool cutoff_pruned = score.add_output.sorted_branch_pruned_by_cutoff != 0 || score.sub_output.sorted_branch_pruned_by_cutoff != 0;
+			score.prune_reason = cutoff_pruned ? "cddt_no_direct_input_source_addsub_output_hint_within_cutoff" : "cddt_no_two_variable_addsub_output";
 			return score;
 		}
 		const double add_weight = score.add_output.possible ? static_cast<double>( score.add_output.weight ) : std::numeric_limits<double>::infinity();
@@ -1475,15 +1515,16 @@ namespace neoalzette_diff_milp
 		attempt.has_endpoint = true;
 		enumeration.no_good_cuts.push_back( result.no_good );
 		++attempt.blocking_cuts;
-		if ( !run_log.has_global_best || result.snapshot.objective < run_log.global_best_weight - 1e-8 )
+		const double forest_total_weight = attempt.cumulative_weight_before + result.snapshot.objective;
+		if ( !run_log.has_global_best || forest_total_weight < run_log.global_best_weight - 1e-8 )
 		{
 			run_log.has_global_best = true;
-			run_log.global_best_weight = result.snapshot.objective;
+			run_log.global_best_weight = forest_total_weight;
 			run_log.global_best_endpoint = endpoint_from_snapshot( result.snapshot );
 			run_log.global_best_trail_count = 1;
 			attempt.updated_global_best = true;
 		}
-		else if ( std::fabs( result.snapshot.objective - run_log.global_best_weight ) <= 1e-8 )
+		else if ( std::fabs( forest_total_weight - run_log.global_best_weight ) <= 1e-8 )
 		{
 			++run_log.global_best_trail_count;
 		}
@@ -1989,6 +2030,35 @@ namespace neoalzette_diff_milp
 			ForestCandidate candidate = candidate_bank.top();
 			candidate_bank.pop();
 			ForestAttemptLog attempt = make_forest_attempt( candidate, run_log.total_attempts, bank_size_before );
+			if ( run_log.has_global_best )
+			{
+				const double local_cutoff = run_log.global_best_weight - candidate.cumulative_weight;
+				attempt.bnb_prune_checked = true;
+				attempt.bnb_previous_global_best = run_log.global_best_weight;
+				attempt.bnb_cutoff_weight = local_cutoff;
+				attempt.bnb_prune_rule = "cddt_q2_sorted_free_slot_bound";
+				attempt.bnb_bound_expression = "candidate_cumulative_weight + CDDT_Q2_local_lower_bound <= global_best_weight";
+				apply_cddt_cutoff_rescore_for_attempt( attempt, local_cutoff );
+				attempt.bnb_candidate_weight = std::isfinite( attempt.cddt_branch_score.score ) ? candidate.cumulative_weight + attempt.cddt_branch_score.score : std::numeric_limits<double>::infinity();
+				if ( local_cutoff < -1e-8 )
+				{
+					attempt.cddt_early_pruned = true;
+					attempt.bnb_pruned = true;
+					attempt.bnb_prune_proven = true;
+					attempt.pruned = true;
+					attempt.stop_reason = "cddt_q2_cutoff_negative_after_cumulative_weight";
+					attempt.bnb_prune_message = "cumulative weight already exceeds the current forest global best";
+					++attempt.cddt_operator_steps.early_pruned_by_objective_cutoff;
+				}
+				else if ( cddt_score_exceeds_cutoff( attempt.cddt_branch_score, local_cutoff ) )
+				{
+					attempt.bnb_prune_message = "CDDT Q2 helper exceeded cutoff; kept for SCIP because this source-level helper is a bound/order oracle, not a complete operator-level Matsui branch";
+				}
+				else
+				{
+					attempt.bnb_prune_message = "CDDT Q2 bound kept candidate; SCIP receives the same objective cutoff";
+				}
+			}
 			attempt.input_frequency = ++input_frequency[ pack_input_difference( attempt.input ) ];
 			attempt.duplicate_input = attempt.input_frequency > 1;
 			run_log.max_layer = std::max( run_log.max_layer, attempt.layer );
@@ -2011,6 +2081,13 @@ namespace neoalzette_diff_milp
 
 			const double best_remaining_hull_time = forest_remaining_budget_for_solver( forest_options, forest_start );
 			SearchOptions best_options = make_best_search_options_for_input( options, attempt.input, best_remaining_hull_time );
+			if ( attempt.bnb_prune_checked && std::isfinite( attempt.bnb_cutoff_weight ) )
+			{
+				best_options.objective_window_enabled = true;
+				best_options.objective_window_from = std::numeric_limits<double>::quiet_NaN();
+				best_options.objective_window_to = std::max( 0.0, attempt.bnb_cutoff_weight );
+				++attempt.cddt_operator_steps.solver_cutoff_constraints;
+			}
 			EnumerationState best_enumeration;
 			ScipSolveResult best_result = solve_in_model( best_options, best_enumeration, true );
 			++attempt.solver_calls;
